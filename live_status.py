@@ -17,10 +17,12 @@ PING_TARGETS = ["10.50.20.1", "1.1.1.1"]
 PING_INTERVAL_SECONDS = 1.0
 PING_SUBPROCESS_TIMEOUT = 2.0  # safety timeout per ping attempt
 
-HEARTBEAT_PATH = os.environ.get("HEARTBEAT_PATH", os.path.join(os.getcwd(), "heartbeat.txt"))
+# Use env var if provided and non-empty; otherwise default to cwd/heartbeat.txt
+_hb_env = os.environ.get("HEARTBEAT_PATH")
+HEARTBEAT_PATH = _hb_env if _hb_env else os.path.join(os.getcwd(), "heartbeat.txt")
 HEARTBEAT_INTERVAL_SECONDS = 1.0
 
-DEFAULT_PORT = int(os.environ.get("PORT", "8080"))
+DEFAULT_PORT = int(os.environ.get("PORT", "80"))
 
 
 def now_utc():

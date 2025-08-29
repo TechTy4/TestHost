@@ -13,7 +13,7 @@ set -euo pipefail
 
 REPO_URL="${REPO_URL:-https://github.com/TechTy4/TestHost.git}"
 TARGET_PARENT="${TARGET_PARENT:-$HOME}"
-PORT="${PORT:-8080}"
+PORT="${PORT:-80}"
 HEARTBEAT_PATH="${HEARTBEAT_PATH:-}"
 
 repo_name="${REPO_URL##*/}"        # e.g. TestHost.git
@@ -58,6 +58,18 @@ fi
 
 cd "${TARGET_DIR}"
 
+# Advisory for privileged ports on Linux
+if [[ "${PORT}" -lt 1024 ]]; then
+  if [[ "${EUID}" -ne 0 ]]; then
+    if [[ "$(uname -s)" == "Linux" ]]; then
+      echo "[live-status] Note: Port ${PORT} requires root or CAP_NET_BIND_SERVICE."
+      echo "              Options:"
+      echo "              - Run with sudo: sudo PORT=${PORT} ./install_and_run.sh"
+      echo "              - Or grant capability: sudo setcap 'cap_net_bind_service=+ep' \"$(command -v ${PYTHON_BIN})\""
+    fi
+  fi
+fi
+
 # Stop any previous instance
 if [[ -f live_status.pid ]]; then
   OLD_PID=$(cat live_status.pid || true)
@@ -68,7 +80,9 @@ if [[ -f live_status.pid ]]; then
   fi
 fi
 
-export HEARTBEAT_PATH
+if [[ -n "$HEARTBEAT_PATH" ]]; then
+  export HEARTBEAT_PATH
+fi
 echo "[live-status] Starting server..."
 nohup "${PYTHON_BIN}" live_status.py "${PORT}" > live_status.log 2>&1 &
 NEW_PID=$!
@@ -83,7 +97,13 @@ elif command -v wget >/dev/null 2>&1; then
   wget -qO- "$URL" || true
 fi
 
+# Ensure it stayed up
+if ! ps -p "${NEW_PID}" >/dev/null 2>&1; then
+  echo "[live-status] Server failed to start. Recent log:" >&2
+  tail -n 60 live_status.log >&2 || true
+  exit 1
+fi
+
 echo "[live-status] Running (pid ${NEW_PID}). Logs: ${TARGET_DIR}/live_status.log"
 echo "[live-status] Visit: http://$(hostname -f 2>/dev/null || hostname):${PORT}/"
 echo "[live-status] To stop: kill \$(cat ${TARGET_DIR}/live_status.pid)"
-

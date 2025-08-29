@@ -18,7 +18,7 @@ Requirements: Python 3.7+ and the system `ping` binary available in PATH.
 Run:
 
 ```
-python3 live_status.py              # listens on 0.0.0.0:8080
+python3 live_status.py              # listens on 0.0.0.0:80
 # or choose a port
 python3 live_status.py 9090
 # or via env var
@@ -28,7 +28,7 @@ PORT=9000 python3 live_status.py
 Open the page:
 
 ```
-http://<server-ip>:8080/
+http://<server-ip>/
 ```
 
 
@@ -41,6 +41,10 @@ Notes
 - Headers and meta tags disable caching; the page reloads every second.
 - The primary IPv4 is derived from the system’s default route; additional local IPv4s are shown if resolvable.
 - A JSON health endpoint is available at `/health` for simple checks.
+
+- Binding to port 80 on Linux requires root or capability `CAP_NET_BIND_SERVICE`. Options:
+  - Run with sudo: `sudo PORT=80 python3 live_status.py`
+  - Or grant capability once: `sudo setcap 'cap_net_bind_service=+ep' $(command -v python3)`
 
 
 Customization
@@ -90,4 +94,3 @@ Troubleshooting
 - If ping shows FAIL, ensure the host is reachable and that the `ping` utility is installed and permitted for non‑root users.
 - On macOS/BSD, the script tries alternate `ping` flags automatically.
 - If the heartbeat shows an error, check that the directory for `HEARTBEAT_PATH` is writable by the process.
-
