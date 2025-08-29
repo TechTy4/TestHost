@@ -140,7 +140,7 @@ class EventLogger:
                 pass
 
     def log(self, event: str, **fields):
-        ts = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+        ts = datetime.now(timezone.utc).isoformat()
         parts = [f"{k}={json.dumps(v, separators=(',',':'))}" for k, v in fields.items()]
         line = f"{ts} {event} " + " ".join(parts) + "\n"
         with self.lock:
@@ -405,8 +405,9 @@ def render_index() -> bytes:
             return "(no events yet)"
 
     events_text = tail_events(EVENTS_LOG_PATH)
+    meta_refresh = '<meta http-equiv="refresh" content="1" />' if os.environ.get('META_REFRESH') == '1' else ''
 
-    # Simple, light HTML. Auto-refresh every 1 second.
+    # Simple, light HTML. Optional meta refresh; JS updates in place via app.js
     html = f"""
 <!doctype html>
 <html lang="en">
@@ -415,7 +416,7 @@ def render_index() -> bytes:
   <meta http-equiv="cache-control" content="no-store, no-cache, must-revalidate" />
   <meta http-equiv="pragma" content="no-cache" />
   <meta http-equiv="expires" content="0" />
-  %s
+  {meta_refresh}
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Live Server Status</title>
   <style>
@@ -468,7 +469,7 @@ def render_index() -> bytes:
   </div>
 </body>
 </html>
-""" % ("<meta http-equiv=\"refresh\" content=\"1\" />" if os.environ.get("META_REFRESH") == "1" else "")
+"""
     return html.encode("utf-8")
 
 
