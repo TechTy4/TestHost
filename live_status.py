@@ -208,13 +208,14 @@ def ping_worker():
             ok, latency, err = try_ping_once(target)
             PING_STATE.increment(target, ok)
             PING_STATE.update(target, ok, latency, err)
-            if prev_ok[target] is None:
+            prev = prev_ok.get(target)
+            if prev is None:
                 # First observation: log it so we have a baseline
                 if ok:
                     EVENTS.log("PING_UP", target=target, latency_ms=latency)
                 else:
                     EVENTS.log("PING_DOWN", target=target, error=err)
-            elif prev_ok[target] is not ok:
+            elif prev is not ok:
                 # Transition
                 if ok:
                     EVENTS.log("PING_UP", target=target, latency_ms=latency)
@@ -332,6 +333,18 @@ def html_escape(s: str) -> str:
         .replace("'", "&#39;")
     )
 
+def tail_events(path: str, max_bytes: int = 65536, max_lines: int = 200) -> str:
+    try:
+        size = os.path.getsize(path)
+        with open(path, 'rb') as f:
+            if size > max_bytes:
+                f.seek(-max_bytes, os.SEEK_END)
+            data = f.read().decode('utf-8', errors='replace')
+        lines = data.splitlines()[-max_lines:]
+        return "\n".join(lines)
+    except Exception:
+        return "(no events yet)"
+
 
 def make_status_payload() -> dict:
     pings = PING_STATE.snapshot()
@@ -390,19 +403,6 @@ def render_index() -> bytes:
     hb_err = hb["last_error"]
     hb_err_html = f"<div style='color:#cc2222'>Error: {html_escape(hb_err)}</div>" if hb_err else ""
     hb_file = HEARTBEAT.path
-
-    # Tail events log for UI display
-    def tail_events(path: str, max_bytes: int = 65536, max_lines: int = 200) -> str:
-        try:
-            size = os.path.getsize(path)
-            with open(path, 'rb') as f:
-                if size > max_bytes:
-                    f.seek(-max_bytes, os.SEEK_END)
-                data = f.read().decode('utf-8', errors='replace')
-            lines = data.splitlines()[-max_lines:]
-            return "\n".join(lines)
-        except Exception:
-            return "(no events yet)"
 
     events_text = tail_events(EVENTS_LOG_PATH)
     meta_refresh = '<meta http-equiv="refresh" content="1" />' if os.environ.get('META_REFRESH') == '1' else ''
