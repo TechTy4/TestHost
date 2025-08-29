@@ -1,0 +1,8 @@
+heartbeat.txt
+events.log
+live_status.log
+live_status.pid
+__pycache__/
+*.pyc
+.DS_Store
+.env

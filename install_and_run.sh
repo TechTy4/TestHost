@@ -42,7 +42,16 @@ if [[ ! -d "${TARGET_DIR}/.git" ]]; then
   git clone --depth 1 "${REPO_URL}" "${TARGET_DIR}"
 else
   echo "[live-status] Updating existing checkout..."
-  git -C "${TARGET_DIR}" pull --ff-only
+  # Force update to remote to avoid conflicts with generated files like heartbeat.txt
+  git -C "${TARGET_DIR}" fetch --all --prune
+  # Reset working tree to origin/main (destructive to local changes)
+  if git -C "${TARGET_DIR}" show-ref --verify --quiet refs/remotes/origin/main; then
+    git -C "${TARGET_DIR}" reset --hard origin/main
+  else
+    # Fallback: reset to fetched HEAD
+    git -C "${TARGET_DIR}" reset --hard FETCH_HEAD
+  fi
+  git -C "${TARGET_DIR}" clean -fd
 fi
 
 # Pick Python
