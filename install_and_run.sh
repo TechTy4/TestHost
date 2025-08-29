@@ -15,6 +15,7 @@ REPO_URL="${REPO_URL:-https://github.com/TechTy4/TestHost.git}"
 TARGET_PARENT="${TARGET_PARENT:-$HOME}"
 PORT="${PORT:-80}"
 HEARTBEAT_PATH="${HEARTBEAT_PATH:-}"
+EVENTS_LOG_PATH="${EVENTS_LOG_PATH:-}"
 
 repo_name="${REPO_URL##*/}"        # e.g. TestHost.git
 repo_dir="${repo_name%.git}"       # e.g. TestHost
@@ -25,6 +26,9 @@ echo "[live-status] Checkout: ${TARGET_DIR}"
 echo "[live-status] Port:    ${PORT}"
 if [[ -n "$HEARTBEAT_PATH" ]]; then
   echo "[live-status] Heartbeat: ${HEARTBEAT_PATH}"
+fi
+if [[ -n "$EVENTS_LOG_PATH" ]]; then
+  echo "[live-status] Events log: ${EVENTS_LOG_PATH}"
 fi
 
 if ! command -v git >/dev/null 2>&1; then
@@ -82,6 +86,9 @@ fi
 
 if [[ -n "$HEARTBEAT_PATH" ]]; then
   export HEARTBEAT_PATH
+fi
+if [[ -n "$EVENTS_LOG_PATH" ]]; then
+  export EVENTS_LOG_PATH
 fi
 echo "[live-status] Starting server..."
 nohup "${PYTHON_BIN}" live_status.py "${PORT}" > live_status.log 2>&1 &

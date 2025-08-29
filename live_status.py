@@ -9,6 +9,7 @@ import threading
 import subprocess
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Optional
 from datetime import datetime, timezone
 
 
@@ -20,6 +21,11 @@ PING_SUBPROCESS_TIMEOUT = 2.0  # safety timeout per ping attempt
 # Use env var if provided and non-empty; otherwise default to cwd/heartbeat.txt
 _hb_env = os.environ.get("HEARTBEAT_PATH")
 HEARTBEAT_PATH = _hb_env if _hb_env else os.path.join(os.getcwd(), "heartbeat.txt")
+
+# Events log (records ping outages and disk errors)
+_ev_env = os.environ.get("EVENTS_LOG_PATH")
+EVENTS_LOG_PATH = _ev_env if _ev_env else os.path.join(os.getcwd(), "events.log")
+EVENTS_FSYNC = os.environ.get("EVENTS_FSYNC", "0") == "1"
 HEARTBEAT_INTERVAL_SECONDS = 1.0
 
 DEFAULT_PORT = int(os.environ.get("PORT", "80"))
@@ -78,12 +84,30 @@ def all_ipv4_addrs() -> list:
 class PingState:
     def __init__(self, targets):
         self.lock = threading.Lock()
-        # target -> {"ok": bool, "latency_ms": float|None, "ts": datetime}
-        self.latest = {t: {"ok": False, "latency_ms": None, "ts": None} for t in targets}
+        # target -> {"ok": bool, "latency_ms": float|None, "ts": datetime, "err": str|None, "misses": int, "checks": int}
+        self.latest = {
+            t: {"ok": False, "latency_ms": None, "ts": None, "err": None, "misses": 0, "checks": 0}
+            for t in targets
+        }
 
-    def update(self, target, ok: bool, latency_ms):
+    def update(self, target, ok: bool, latency_ms, err: Optional[str]):
         with self.lock:
-            self.latest[target] = {"ok": ok, "latency_ms": latency_ms, "ts": now_utc()}
+            prev = self.latest.get(target) or {}
+            self.latest[target] = {
+                "ok": ok,
+                "latency_ms": latency_ms,
+                "ts": now_utc(),
+                "err": err,
+                "misses": prev.get("misses", 0),
+                "checks": prev.get("checks", 0),
+            }
+
+    def increment(self, target, ok: bool):
+        with self.lock:
+            st = self.latest.setdefault(target, {"ok": False, "latency_ms": None, "ts": None, "err": None, "misses": 0, "checks": 0})
+            st["checks"] = st.get("checks", 0) + 1
+            if not ok:
+                st["misses"] = st.get("misses", 0) + 1
 
     def snapshot(self):
         with self.lock:
@@ -92,6 +116,40 @@ class PingState:
 
 
 PING_STATE = PingState(PING_TARGETS)
+
+
+class EventLogger:
+    def __init__(self, path: str, fsync: bool = False):
+        self.path = path
+        self.fsync = fsync
+        self.lock = threading.Lock()
+        # Ensure directory exists
+        d = os.path.dirname(self.path)
+        if d and not os.path.exists(d):
+            try:
+                os.makedirs(d, exist_ok=True)
+            except Exception:
+                pass
+
+    def log(self, event: str, **fields):
+        ts = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+        parts = [f"{k}={json.dumps(v, separators=(',',':'))}" for k, v in fields.items()]
+        line = f"{ts} {event} " + " ".join(parts) + "\n"
+        with self.lock:
+            try:
+                with open(self.path, "ab", buffering=0) as f:
+                    f.write(line.encode("utf-8"))
+                    if self.fsync:
+                        os.fsync(f.fileno())
+            except Exception:
+                # As a fallback, print to stderr
+                try:
+                    sys.stderr.write(line)
+                except Exception:
+                    pass
+
+
+EVENTS = EventLogger(EVENTS_LOG_PATH, fsync=EVENTS_FSYNC)
 
 
 def try_ping_once(target: str):
@@ -119,7 +177,7 @@ def try_ping_once(target: str):
                     latency_ms = float(m.group(1))
                 else:
                     latency_ms = round(elapsed_ms, 2)
-                return True, latency_ms
+                return True, latency_ms, None
             else:
                 last_error = proc.stderr or proc.stdout
         except FileNotFoundError as e:
@@ -131,15 +189,30 @@ def try_ping_once(target: str):
             last_error = str(e)
 
     # If we got here, ping failed
-    return False, None
+    return False, None, last_error or "unknown"
 
 
 def ping_worker():
+    prev_ok = {t: None for t in PING_TARGETS}
     while True:
         cycle_start = time.monotonic()
         for target in PING_TARGETS:
-            ok, latency = try_ping_once(target)
-            PING_STATE.update(target, ok, latency)
+            ok, latency, err = try_ping_once(target)
+            PING_STATE.increment(target, ok)
+            PING_STATE.update(target, ok, latency, err)
+            if prev_ok[target] is None:
+                # First observation: log it so we have a baseline
+                if ok:
+                    EVENTS.log("PING_UP", target=target, latency_ms=latency)
+                else:
+                    EVENTS.log("PING_DOWN", target=target, error=err)
+            elif prev_ok[target] is not ok:
+                # Transition
+                if ok:
+                    EVENTS.log("PING_UP", target=target, latency_ms=latency)
+                else:
+                    EVENTS.log("PING_DOWN", target=target, error=err)
+            prev_ok[target] = ok
         # Pace the loop roughly to the interval
         elapsed = time.monotonic() - cycle_start
         sleep_for = max(0.0, PING_INTERVAL_SECONDS - elapsed)
@@ -186,6 +259,7 @@ def heartbeat_worker():
         except Exception as e:
             HEARTBEAT.record_error(e)
 
+    had_error = False
     while True:
         try:
             payload = {
@@ -198,8 +272,14 @@ def heartbeat_worker():
                 f.flush()
                 os.fsync(f.fileno())
             HEARTBEAT.record_success(len(data))
+            if had_error:
+                EVENTS.log("HEARTBEAT_RECOVERED", path=HEARTBEAT.path, bytes=len(data))
+                had_error = False
         except Exception as e:
             HEARTBEAT.record_error(e)
+            if not had_error:
+                EVENTS.log("HEARTBEAT_ERROR", path=HEARTBEAT.path, error=str(e))
+                had_error = True
         time.sleep(HEARTBEAT_INTERVAL_SECONDS)
 
 
@@ -260,12 +340,28 @@ def render_index() -> bytes:
         when = format_dt(ts) if ts else "—"
         color = "#22aa22" if status == "OK" else "#cc2222"
         latency_s = f"{latency:.2f} ms" if latency is not None else "—"
-        return f"<tr><td>{html_escape(target)}</td><td style='color:{color};font-weight:bold'>{status}</td><td>{latency_s}</td><td>{html_escape(when)}</td></tr>"
+        misses = data.get("misses", 0)
+        return f"<tr><td>{html_escape(target)}</td><td style='color:{color};font-weight:bold'>{status}</td><td>{latency_s}</td><td>{misses}</td><td>{html_escape(when)}</td></tr>"
 
     hb_when = format_dt(hb["last_write_ts"]) if hb["last_write_ts"] else "—"
     hb_err = hb["last_error"]
     hb_err_html = f"<div style='color:#cc2222'>Error: {html_escape(hb_err)}</div>" if hb_err else ""
     hb_file = HEARTBEAT.path
+
+    # Tail events log for UI display
+    def tail_events(path: str, max_bytes: int = 65536, max_lines: int = 200) -> str:
+        try:
+            size = os.path.getsize(path)
+            with open(path, 'rb') as f:
+                if size > max_bytes:
+                    f.seek(-max_bytes, os.SEEK_END)
+                data = f.read().decode('utf-8', errors='replace')
+            lines = data.splitlines()[-max_lines:]
+            return "\n".join(lines)
+        except Exception:
+            return "(no events yet)"
+
+    events_text = tail_events(EVENTS_LOG_PATH)
 
     # Simple, light HTML. Auto-refresh every 1 second.
     html = f"""
@@ -287,6 +383,7 @@ def render_index() -> bytes:
     th, td {{ padding: 0.35rem 0.6rem; border-bottom: 1px solid #e5e5e5; text-align: left; }}
     .section {{ margin-top: 1rem; }}
     code {{ background: #f2f2f2; padding: 0.1rem 0.25rem; border-radius: 3px; }}
+    pre {{ background: #f8f8f8; border: 1px solid #eee; padding: 0.5rem; border-radius: 4px; max-height: 240px; overflow: auto; }}
   </style>
 </head>
 <body>
@@ -302,7 +399,7 @@ def render_index() -> bytes:
     <strong>Ping</strong>
     <table>
       <thead>
-        <tr><th>Target</th><th>Status</th><th>Latency</th><th>Last Check</th></tr>
+        <tr><th>Target</th><th>Status</th><th>Latency</th><th>Missed</th><th>Last Check</th></tr>
       </thead>
       <tbody>
         {''.join(ping_row(t, pings.get(t, {})) for t in PING_TARGETS)}
@@ -318,8 +415,11 @@ def render_index() -> bytes:
     <div class="muted">Disk usage ({html_escape(disk['path'])}): total {human_bytes(disk['total'])}, used {human_bytes(disk['used'])}, free {human_bytes(disk['free'])}</div>
   </div>
 
-  <div class="section muted">
-    Cache disabled; page refreshes every second.
+  <div class="section">
+    <strong>Events Log</strong>
+    <div class="muted">Path: <code>{html_escape(EVENTS_LOG_PATH)}</code> (last entries)</div>
+    <pre>{html_escape(events_text)}</pre>
+    <div class="muted">Cache disabled; page refreshes every second.</div>
   </div>
 </body>
 </html>

@@ -8,6 +8,8 @@ Tiny, dependency‑free Python server that serves a live status page:
 - Continuous ping results to `10.50.20.1` and `1.1.1.1`
 - Disk activity proof via a heartbeat file written every second
 - No caching; page auto‑refreshes every second
+- Events log records ping outages and heartbeat write errors/recoveries
+ - UI shows per-target missed ping count and tails the events log at the bottom
 
 
 Quick Start
@@ -58,6 +60,12 @@ HEARTBEAT_PATH=/var/tmp/heartbeat.txt python3 live_status.py
 
 - Change ping targets: edit `PING_TARGETS` in `live_status.py`.
 
+- Change events log location:
+
+```
+EVENTS_LOG_PATH=/var/log/live-status/events.log python3 live_status.py
+```
+
 
 Systemd (optional)
 ------------------
@@ -94,3 +102,8 @@ Troubleshooting
 - If ping shows FAIL, ensure the host is reachable and that the `ping` utility is installed and permitted for non‑root users.
 - On macOS/BSD, the script tries alternate `ping` flags automatically.
 - If the heartbeat shows an error, check that the directory for `HEARTBEAT_PATH` is writable by the process.
+- Event log: tail it to see outages and recoveries
+
+```
+tail -f events.log
+```
