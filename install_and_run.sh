@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Quick installer/runner for the Live Status monitor.
+# - Clones or updates the repo
+# - Launches the server with nohup and writes live_status.pid
+#
+# Config via env vars (override as needed):
+#   REPO_URL       - Git URL to clone (defaults to this repo)
+#   TARGET_PARENT  - Parent dir for checkout (default: $HOME)
+#   PORT           - HTTP port (default: 8080)
+#   HEARTBEAT_PATH - Heartbeat file path (optional)
+
+REPO_URL="${REPO_URL:-https://github.com/TechTy4/TestHost.git}"
+TARGET_PARENT="${TARGET_PARENT:-$HOME}"
+PORT="${PORT:-8080}"
+HEARTBEAT_PATH="${HEARTBEAT_PATH:-}"
+
+repo_name="${REPO_URL##*/}"        # e.g. TestHost.git
+repo_dir="${repo_name%.git}"       # e.g. TestHost
+TARGET_DIR="${TARGET_PARENT%/}/${repo_dir}"
+
+echo "[live-status] Repo:    ${REPO_URL}"
+echo "[live-status] Checkout: ${TARGET_DIR}"
+echo "[live-status] Port:    ${PORT}"
+if [[ -n "$HEARTBEAT_PATH" ]]; then
+  echo "[live-status] Heartbeat: ${HEARTBEAT_PATH}"
+fi
+
+if ! command -v git >/dev/null 2>&1; then
+  echo "Error: git is required" >&2
+  exit 1
+fi
+
+# Clone or update
+if [[ ! -d "${TARGET_DIR}/.git" ]]; then
+  mkdir -p "${TARGET_PARENT}"
+  git clone --depth 1 "${REPO_URL}" "${TARGET_DIR}"
+else
+  echo "[live-status] Updating existing checkout..."
+  git -C "${TARGET_DIR}" pull --ff-only
+fi
+
+# Pick Python
+PYTHON_BIN=""
+if command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN="python3"
+elif command -v python >/dev/null 2>&1; then
+  PYTHON_BIN="python"
+else
+  echo "Error: Python 3 is required (python3 not found)" >&2
+  exit 1
+fi
+
+if ! command -v ping >/dev/null 2>&1; then
+  echo "[live-status] Warning: 'ping' not found; ping checks may show FAIL." >&2
+fi
+
+cd "${TARGET_DIR}"
+
+# Stop any previous instance
+if [[ -f live_status.pid ]]; then
+  OLD_PID=$(cat live_status.pid || true)
+  if [[ -n "${OLD_PID:-}" ]] && ps -p "${OLD_PID}" >/dev/null 2>&1; then
+    echo "[live-status] Stopping previous instance (pid ${OLD_PID})"
+    kill "${OLD_PID}" || true
+    sleep 0.5 || true
+  fi
+fi
+
+export HEARTBEAT_PATH
+echo "[live-status] Starting server..."
+nohup "${PYTHON_BIN}" live_status.py "${PORT}" > live_status.log 2>&1 &
+NEW_PID=$!
+echo "${NEW_PID}" > live_status.pid
+sleep 1
+
+# Quick health check
+URL="http://127.0.0.1:${PORT}/health"
+if command -v curl >/dev/null 2>&1; then
+  curl -fsS --max-time 2 "$URL" || true
+elif command -v wget >/dev/null 2>&1; then
+  wget -qO- "$URL" || true
+fi
+
+echo "[live-status] Running (pid ${NEW_PID}). Logs: ${TARGET_DIR}/live_status.log"
+echo "[live-status] Visit: http://$(hostname -f 2>/dev/null || hostname):${PORT}/"
+echo "[live-status] To stop: kill \$(cat ${TARGET_DIR}/live_status.pid)"
+
