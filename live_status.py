@@ -28,7 +28,7 @@ EVENTS_LOG_PATH = _ev_env if _ev_env else os.path.join(os.getcwd(), "events.log"
 EVENTS_FSYNC = os.environ.get("EVENTS_FSYNC", "0") == "1"
 HEARTBEAT_INTERVAL_SECONDS = 1.0
 
-DEFAULT_PORT = int(os.environ.get("PORT", "80"))
+DEFAULT_PORT = int(os.environ.get("PORT", "8080"))
 
 
 def now_utc():

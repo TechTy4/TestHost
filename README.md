@@ -20,7 +20,7 @@ Requirements: Python 3.7+ and the system `ping` binary available in PATH.
 Run:
 
 ```
-python3 live_status.py              # listens on 0.0.0.0:80
+python3 live_status.py              # listens on 0.0.0.0:8080
 # or choose a port
 python3 live_status.py 9090
 # or via env var
@@ -30,7 +30,7 @@ PORT=9000 python3 live_status.py
 Open the page:
 
 ```
-http://<server-ip>/
+http://<server-ip>:8080/
 ```
 
 
@@ -44,7 +44,7 @@ Notes
 - The primary IPv4 is derived from the system’s default route; additional local IPv4s are shown if resolvable.
 - A JSON health endpoint is available at `/health` for simple checks.
 
-- Binding to port 80 on Linux requires root or capability `CAP_NET_BIND_SERVICE`. Options:
+- If you switch to port 80 on Linux, it requires root or capability `CAP_NET_BIND_SERVICE`.
   - Run with sudo: `sudo PORT=80 python3 live_status.py`
   - Or grant capability once: `sudo setcap 'cap_net_bind_service=+ep' $(command -v python3)`
 

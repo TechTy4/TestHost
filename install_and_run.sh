@@ -13,7 +13,7 @@ set -euo pipefail
 
 REPO_URL="${REPO_URL:-https://github.com/TechTy4/TestHost.git}"
 TARGET_PARENT="${TARGET_PARENT:-$HOME}"
-PORT="${PORT:-80}"
+PORT="${PORT:-8080}"
 HEARTBEAT_PATH="${HEARTBEAT_PATH:-}"
 EVENTS_LOG_PATH="${EVENTS_LOG_PATH:-}"
 
