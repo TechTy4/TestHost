@@ -5,9 +5,11 @@ Tiny, dependency‑free Python server that serves a live status page:
 
 - Current date and time (local, with TZ)
 - Hostname and IPv4(s)
-- Continuous ping results to `10.50.20.1` and `1.1.1.1`
+- Continuous ping results (default target: `1.1.1.1`)
 - Disk activity proof via a heartbeat file written every second
 - No caching; page auto‑refreshes every second
+- Page updates in-place via a tiny JS fetch every second (no full reload).
+- Optional: enable meta refresh instead with `META_REFRESH=1`.
 - Events log records ping outages and heartbeat write errors/recoveries
  - UI shows per-target missed ping count and tails the events log at the bottom
 
@@ -59,6 +61,13 @@ HEARTBEAT_PATH=/var/tmp/heartbeat.txt python3 live_status.py
 ```
 
 - Change ping targets: edit `PING_TARGETS` in `live_status.py`.
+  - Or set via env var (comma-separated):
+
+```
+PING_TARGETS="1.1.1.1,10.50.20.1,8.8.8.8" ./install_and_run.sh
+```
+
+At runtime, you can also add a target using the small form on the page (survives page reloads for the running process).
 
 - Change events log location:
 
@@ -106,4 +115,14 @@ Troubleshooting
 
 ```
 tail -f events.log
+```
+
+
+Meta Refresh (optional)
+----------------------
+
+By default the page uses JS to update content without reloading. If you explicitly want browser meta refresh instead, set:
+
+```
+META_REFRESH=1 ./install_and_run.sh
 ```

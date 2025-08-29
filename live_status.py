@@ -14,7 +14,11 @@ from datetime import datetime, timezone
 
 
 # Configuration
-PING_TARGETS = ["10.50.20.1", "1.1.1.1"]
+_targets_env = os.environ.get("PING_TARGETS", "").strip()
+if _targets_env:
+    PING_TARGETS = [t.strip() for t in _targets_env.split(',') if t.strip()]
+else:
+    PING_TARGETS = ["1.1.1.1"]
 PING_INTERVAL_SECONDS = 1.0
 PING_SUBPROCESS_TIMEOUT = 2.0  # safety timeout per ping attempt
 
@@ -114,6 +118,10 @@ class PingState:
             # Deep copy not needed for rendering simple values
             return {t: v.copy() for t, v in self.latest.items()}
 
+    def targets(self):
+        with self.lock:
+            return list(self.latest.keys())
+
 
 PING_STATE = PingState(PING_TARGETS)
 
@@ -193,10 +201,10 @@ def try_ping_once(target: str):
 
 
 def ping_worker():
-    prev_ok = {t: None for t in PING_TARGETS}
+    prev_ok = {t: None for t in PING_STATE.targets()}
     while True:
         cycle_start = time.monotonic()
-        for target in PING_TARGETS:
+        for target in PING_STATE.targets():
             ok, latency, err = try_ping_once(target)
             PING_STATE.increment(target, ok)
             PING_STATE.update(target, ok, latency, err)
@@ -325,6 +333,41 @@ def html_escape(s: str) -> str:
     )
 
 
+def make_status_payload() -> dict:
+    pings = PING_STATE.snapshot()
+    for t, v in pings.items():
+        ts = v.get("ts")
+        v["ts_fmt"] = format_dt(ts) if ts else None
+        v["ts"] = ts.isoformat() if ts else None
+    hb = HEARTBEAT.snapshot()
+    disk = disk_usage_summary(os.getcwd())
+    return {
+        "now_local": format_dt(datetime.now()),
+        "hostname": socket.gethostname(),
+        "ip_list": all_ipv4_addrs(),
+        "pings": pings,
+        "pings_order": sorted(pings.keys()),
+        "heartbeat": {
+            "path": HEARTBEAT.path,
+            "last_write_fmt": format_dt(hb["last_write_ts"]) if hb["last_write_ts"] else None,
+            "last_error": hb.get("last_error"),
+            "bytes_written": hb.get("bytes_written", 0),
+        },
+        "disk": {
+            "path": disk["path"],
+            "total": disk["total"],
+            "used": disk["used"],
+            "free": disk["free"],
+            "total_h": human_bytes(disk["total"]),
+            "used_h": human_bytes(disk["used"]),
+            "free_h": human_bytes(disk["free"]),
+        },
+        "events": {
+            "path": EVENTS_LOG_PATH,
+            "tail": tail_events(EVENTS_LOG_PATH),
+        },
+    }
+
 def render_index() -> bytes:
     now_local = format_dt(datetime.now())
     host = socket.gethostname()
@@ -372,7 +415,7 @@ def render_index() -> bytes:
   <meta http-equiv="cache-control" content="no-store, no-cache, must-revalidate" />
   <meta http-equiv="pragma" content="no-cache" />
   <meta http-equiv="expires" content="0" />
-  <meta http-equiv="refresh" content="1" />
+  %s
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Live Server Status</title>
   <style>
@@ -385,45 +428,47 @@ def render_index() -> bytes:
     code {{ background: #f2f2f2; padding: 0.1rem 0.25rem; border-radius: 3px; }}
     pre {{ background: #f8f8f8; border: 1px solid #eee; padding: 0.5rem; border-radius: 4px; max-height: 240px; overflow: auto; }}
   </style>
+  <script src="/app.js"></script>
 </head>
 <body>
   <h1>Live Server Status</h1>
-  <div class="muted">Updated: {html_escape(now_local)}</div>
+  <div class="muted">Updated: <span id="updatedAt">{html_escape(now_local)}</span></div>
 
   <div class="section">
-    <strong>Hostname:</strong> {html_escape(host)}<br />
-    <strong>IP:</strong> {html_escape(ips)}
+    <strong>Hostname:</strong> <span id="hostname">{html_escape(host)}</span><br />
+    <strong>IP:</strong> <span id="ipList">{html_escape(ips)}</span>
   </div>
 
   <div class="section">
     <strong>Ping</strong>
+    <div class="muted" style="margin:0.25rem 0">Add target: <form method="GET" action="/add" style="display:inline"><input name="target" placeholder="host or IP" style="padding:0.2rem 0.4rem"/><button type="submit" style="padding:0.2rem 0.5rem">Add</button></form></div>
     <table>
       <thead>
         <tr><th>Target</th><th>Status</th><th>Latency</th><th>Missed</th><th>Last Check</th></tr>
       </thead>
-      <tbody>
-        {''.join(ping_row(t, pings.get(t, {})) for t in PING_TARGETS)}
+      <tbody id="pingBody">
+        {''.join(ping_row(t, pings.get(t, {})) for t in sorted(pings.keys()))}
       </tbody>
     </table>
   </div>
 
   <div class="section">
     <strong>Disk Activity</strong>
-    <div>Heartbeat file: <code>{html_escape(hb_file)}</code></div>
-    <div>Last write: {html_escape(hb_when)} | Chunk: {hb['bytes_written']} bytes</div>
-    {hb_err_html}
-    <div class="muted">Disk usage ({html_escape(disk['path'])}): total {human_bytes(disk['total'])}, used {human_bytes(disk['used'])}, free {human_bytes(disk['free'])}</div>
+    <div>Heartbeat file: <code id="hbFile">{html_escape(hb_file)}</code></div>
+    <div>Last write: <span id="hbWhen">{html_escape(hb_when)}</span> | Chunk: <span id="hbBytes">{hb['bytes_written']}</span> bytes</div>
+    <div id="hbErr" style='color:#cc2222'>{hb_err_html[22:-6] if hb_err_html else ''}</div>
+    <div class="muted" id="diskUsage">Disk usage ({html_escape(disk['path'])}): total {human_bytes(disk['total'])}, used {human_bytes(disk['used'])}, free {human_bytes(disk['free'])}</div>
   </div>
 
   <div class="section">
     <strong>Events Log</strong>
-    <div class="muted">Path: <code>{html_escape(EVENTS_LOG_PATH)}</code> (last entries)</div>
-    <pre>{html_escape(events_text)}</pre>
-    <div class="muted">Cache disabled; page refreshes every second.</div>
+    <div class="muted">Path: <code id="eventsPath">{html_escape(EVENTS_LOG_PATH)}</code> (last entries)</div>
+    <pre id="eventsPre">{html_escape(events_text)}</pre>
+    <div class="muted">Cache disabled; updates every second without full reload.</div>
   </div>
 </body>
 </html>
-"""
+""" % ("<meta http-equiv=\"refresh\" content=\"1\" />" if os.environ.get("META_REFRESH") == "1" else "")
     return html.encode("utf-8")
 
 
@@ -439,8 +484,58 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        if self.path == "/app.js":
+            try:
+                with open(os.path.join(os.getcwd(), "app.js"), "rb") as f:
+                    data = f.read()
+            except Exception:
+                data = b""
+            self.send_response(200)
+            self.send_header("Content-Type", "application/javascript")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if self.path.startswith("/add?"):
+            # Simple add-target endpoint: /add?target=host-or-ip
+            try:
+                from urllib.parse import urlsplit, parse_qs
+                qs = parse_qs(urlsplit(self.path).query)
+                target = (qs.get('target', [''])[0] or '').strip()
+            except Exception:
+                target = ''
+            if target and re.match(r"^[A-Za-z0-9_.:-]+$", target) and len(target) <= 253:
+                # Initialize state entry if missing
+                with PING_STATE.lock:
+                    if target not in PING_STATE.latest:
+                        PING_STATE.latest[target] = {"ok": False, "latency_ms": None, "ts": None, "err": None, "misses": 0, "checks": 0}
+                EVENTS.log("PING_TARGET_ADDED", target=target)
+                # Redirect back to root
+                self.send_response(302)
+                self.send_header('Location', '/')
+                self.end_headers()
+                return
+            # Bad request
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b'Invalid target')
+            return
         if self.path.startswith("/health"):
             payload = {"ok": True, "time": now_utc().isoformat(), "host": socket.gethostname()}
+            data = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        if self.path.startswith("/status.json"):
+            payload = make_status_payload()
             data = json.dumps(payload).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
