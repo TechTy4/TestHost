@@ -33,6 +33,7 @@ EVENTS_FSYNC = os.environ.get("EVENTS_FSYNC", "0") == "1"
 HEARTBEAT_INTERVAL_SECONDS = 1.0
 
 DEFAULT_PORT = int(os.environ.get("PORT", "8080"))
+STARTED_AT = datetime.now(timezone.utc)
 
 
 def now_utc():
@@ -130,6 +131,55 @@ class PingState:
             return False
 
 
+class ServiceState:
+    def __init__(self, targets=None):
+        self.lock = threading.Lock()
+        targets = targets or []
+        # key like "host:port" -> state
+        self.latest = {
+            t: {"ok": False, "latency_ms": None, "ts": None, "err": None, "misses": 0, "checks": 0}
+            for t in targets
+        }
+
+    def targets(self):
+        with self.lock:
+            return list(self.latest.keys())
+
+    def ensure(self, target: str):
+        with self.lock:
+            self.latest.setdefault(target, {"ok": False, "latency_ms": None, "ts": None, "err": None, "misses": 0, "checks": 0})
+
+    def remove(self, target: str) -> bool:
+        with self.lock:
+            if target in self.latest:
+                self.latest.pop(target, None)
+                return True
+            return False
+
+    def increment(self, target: str, ok: bool):
+        with self.lock:
+            st = self.latest.setdefault(target, {"ok": False, "latency_ms": None, "ts": None, "err": None, "misses": 0, "checks": 0})
+            st["checks"] = st.get("checks", 0) + 1
+            if not ok:
+                st["misses"] = st.get("misses", 0) + 1
+
+    def update(self, target: str, ok: bool, latency_ms, err: Optional[str]):
+        with self.lock:
+            prev = self.latest.get(target) or {}
+            self.latest[target] = {
+                "ok": ok,
+                "latency_ms": latency_ms,
+                "ts": now_utc(),
+                "err": err,
+                "misses": prev.get("misses", 0),
+                "checks": prev.get("checks", 0),
+            }
+
+    def snapshot(self):
+        with self.lock:
+            return {t: v.copy() for t, v in self.latest.items()}
+
+
 PING_STATE = PingState(PING_TARGETS)
 
 
@@ -165,6 +215,7 @@ class EventLogger:
 
 
 EVENTS = EventLogger(EVENTS_LOG_PATH, fsync=EVENTS_FSYNC)
+SERVICES = ServiceState([])
 
 
 def try_ping_once(target: str):
@@ -207,6 +258,26 @@ def try_ping_once(target: str):
     return False, None, last_error or "unknown"
 
 
+def try_tcp_once(target: str):
+    # target like "host:port"
+    host, _, port_s = target.rpartition(':')
+    if not host or not port_s.isdigit():
+        return False, None, "invalid target"
+    port = int(port_s)
+    try:
+        start = time.perf_counter()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(2.0)
+        try:
+            sock.connect((host, port))
+        finally:
+            sock.close()
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        return True, round(elapsed_ms, 2), None
+    except Exception as e:
+        return False, None, str(e)
+
+
 def ping_worker():
     prev_ok = {t: None for t in PING_STATE.targets()}
     while True:
@@ -230,6 +301,31 @@ def ping_worker():
                     EVENTS.log("PING_DOWN", target=target, error=err)
             prev_ok[target] = ok
         # Pace the loop roughly to the interval
+        elapsed = time.monotonic() - cycle_start
+        sleep_for = max(0.0, PING_INTERVAL_SECONDS - elapsed)
+        time.sleep(sleep_for)
+
+
+def service_worker():
+    prev_ok = {t: None for t in SERVICES.targets()}
+    while True:
+        cycle_start = time.monotonic()
+        for target in SERVICES.targets():
+            ok, latency, err = try_tcp_once(target)
+            SERVICES.increment(target, ok)
+            SERVICES.update(target, ok, latency, err)
+            prev = prev_ok.get(target)
+            if prev is None:
+                if ok:
+                    EVENTS.log("SERVICE_UP", target=target, latency_ms=latency)
+                else:
+                    EVENTS.log("SERVICE_DOWN", target=target, error=err)
+            elif prev is not ok:
+                if ok:
+                    EVENTS.log("SERVICE_UP", target=target, latency_ms=latency)
+                else:
+                    EVENTS.log("SERVICE_DOWN", target=target, error=err)
+            prev_ok[target] = ok
         elapsed = time.monotonic() - cycle_start
         sleep_for = max(0.0, PING_INTERVAL_SECONDS - elapsed)
         time.sleep(sleep_for)
@@ -361,12 +457,33 @@ def make_status_payload() -> dict:
         v["ts"] = ts.isoformat() if ts else None
     hb = HEARTBEAT.snapshot()
     disk = disk_usage_summary(os.getcwd())
+    # build services snapshot
+    services = SERVICES.snapshot()
+    for t, v in services.items():
+        ts = v.get("ts")
+        v["ts_fmt"] = format_dt(ts) if ts else None
+        v["ts"] = ts.isoformat() if ts else None
+    # system summary
+    try:
+        load1, load5, load15 = os.getloadavg()
+    except Exception:
+        load1 = load5 = load15 = None
+    host_uptime = None
+    try:
+        with open('/proc/uptime','r') as f:
+            secs = float(f.read().split()[0])
+            host_uptime = int(secs)
+    except Exception:
+        host_uptime = None
+    proc_uptime = int((datetime.now(timezone.utc) - STARTED_AT).total_seconds())
     return {
         "now_local": format_dt(datetime.now()),
         "hostname": socket.gethostname(),
         "ip_list": all_ipv4_addrs(),
         "pings": pings,
         "pings_order": sorted(pings.keys()),
+        "services": services,
+        "services_order": sorted(services.keys()),
         "heartbeat": {
             "path": HEARTBEAT.path,
             "last_write_fmt": format_dt(hb["last_write_ts"]) if hb["last_write_ts"] else None,
@@ -385,6 +502,14 @@ def make_status_payload() -> dict:
         "events": {
             "path": EVENTS_LOG_PATH,
             "tail": tail_events(EVENTS_LOG_PATH),
+        },
+        "system": {
+            "load1": load1,
+            "load5": load5,
+            "load15": load15,
+            "host_uptime_s": host_uptime,
+            "proc_uptime_s": proc_uptime,
+            "started_at": STARTED_AT.isoformat(),
         },
     }
 
@@ -428,20 +553,38 @@ def render_index() -> bytes:
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Live Server Status</title>
   <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 1.5rem; color: #222; background: #fafafa; }}
+    :root {{
+      --bg: #fafafa; --fg: #222; --muted: #666; --card: #fff; --border: #e5e5e5; --codebg: #f2f2f2; --link: #0b62d6;
+    }}
+    [data-theme="dark"] {{
+      --bg: #0f1115; --fg: #eaeef2; --muted: #97a1ad; --card: #171a21; --border: #2a2f3a; --codebg: #202533; --link: #6aa5ff;
+    }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 1.5rem; color: var(--fg); background: var(--bg); }}
     h1 {{ margin: 0 0 0.25rem 0; font-size: 1.4rem; }}
-    .muted {{ color: #666; font-size: 0.9rem; }}
-    table {{ border-collapse: collapse; margin-top: 0.5rem; }}
-    th, td {{ padding: 0.35rem 0.6rem; border-bottom: 1px solid #e5e5e5; text-align: left; }}
-    .section {{ margin-top: 1rem; }}
-    code {{ background: #f2f2f2; padding: 0.1rem 0.25rem; border-radius: 3px; }}
-    pre {{ background: #f8f8f8; border: 1px solid #eee; padding: 0.5rem; border-radius: 4px; max-height: 240px; overflow: auto; }}
+    .muted {{ color: var(--muted); font-size: 0.9rem; }}
+    table {{ border-collapse: collapse; margin-top: 0.5rem; width: 100%; background: var(--card); }}
+    th, td {{ padding: 0.35rem 0.6rem; border-bottom: 1px solid var(--border); text-align: left; }}
+    .section {{ margin-top: 1rem; background: var(--card); padding: 0.6rem 0.8rem; border: 1px solid var(--border); border-radius: 6px; }}
+    code {{ background: var(--codebg); padding: 0.1rem 0.25rem; border-radius: 3px; }}
+    pre {{ background: var(--codebg); border: 1px solid var(--border); padding: 0.5rem; border-radius: 4px; max-height: 240px; overflow: auto; }}
+    a {{ color: var(--link); text-decoration: none; }}
+    a:hover {{ text-decoration: underline; }}
+    .controls {{ display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }}
+    .chip {{ display:inline-block; padding: 0.15rem 0.5rem; border-radius: 999px; background: var(--codebg); border:1px solid var(--border); }}
+    .btn {{ padding: 0.2rem 0.55rem; border: 1px solid var(--border); background: var(--card); color: var(--fg); border-radius: 4px; cursor: pointer; }}
+    input[type="text"], input[type="number"], input[type="range"] {{ background: var(--card); color: var(--fg); border:1px solid var(--border); border-radius:4px; padding:0.2rem 0.4rem; }}
   </style>
   <script src="/app.js"></script>
 </head>
 <body>
   <h1>Live Server Status</h1>
-  <div class="muted">Updated: <span id="updatedAt">{html_escape(now_local)}</span></div>
+  <div class="controls">
+    <span class="muted">Updated: <span id="updatedAt">{html_escape(now_local)}</span></span>
+    <span class="chip" id="procUptime"></span>
+    <label class="muted">Refresh <input id="refreshMs" type="range" min="500" max="5000" step="100" value="1000" /> <span id="refreshLabel">1.0s</span></label>
+    <button id="pauseBtn" class="btn">Pause</button>
+    <button id="themeBtn" class="btn">Dark</button>
+  </div>
 
   <div class="section">
     <strong>Hostname:</strong> <span id="hostname">{html_escape(host)}</span><br />
@@ -450,7 +593,7 @@ def render_index() -> bytes:
 
   <div class="section">
     <strong>Ping</strong>
-    <div class="muted" style="margin:0.25rem 0">Add target: <form method="GET" action="/add" style="display:inline"><input name="target" placeholder="host or IP" style="padding:0.2rem 0.4rem"/><button type="submit" style="padding:0.2rem 0.5rem">Add</button></form></div>
+    <div class="muted" style="margin:0.25rem 0">Add target: <form method="GET" action="/add" style="display:inline"><input name="target" placeholder="host or IP"/><button type="submit" class="btn">Add</button></form></div>
     <table>
       <thead>
         <tr><th>Target</th><th>Status</th><th>Latency</th><th>Missed</th><th>Last Check</th><th>Actions</th></tr>
@@ -458,6 +601,15 @@ def render_index() -> bytes:
       <tbody id="pingBody">
         {''.join(ping_row(t, pings.get(t, {})) for t in sorted(pings.keys()))}
       </tbody>
+    </table>
+  </div>
+
+  <div class="section">
+    <strong>TCP Checks</strong>
+    <form id="addSvcForm" style="margin:0.25rem 0"><input id="newSvc" type="text" placeholder="Add host:port to check"/><button type="submit" class="btn">Add</button></form>
+    <table>
+      <thead><tr><th>Target</th><th>Status</th><th>Latency</th><th>Missed</th><th>Last Check</th><th>Actions</th></tr></thead>
+      <tbody id="svcBody"></tbody>
     </table>
   </div>
 
@@ -474,6 +626,11 @@ def render_index() -> bytes:
     <div class="muted">Path: <code id="eventsPath">{html_escape(EVENTS_LOG_PATH)}</code> (last entries)</div>
     <pre id="eventsPre">{html_escape(events_text)}</pre>
     <div class="muted">Cache disabled; updates every second without full reload.</div>
+  </div>
+
+  <div class="section">
+    <strong>System</strong>
+    <div class="muted" id="sysLine"></div>
   </div>
 </body>
 </html>
@@ -506,6 +663,43 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Expires", "0")
             self.end_headers()
             self.wfile.write(data)
+            return
+        if self.path.startswith("/addsvc?"):
+            try:
+                from urllib.parse import urlsplit, parse_qs
+                qs = parse_qs(urlsplit(self.path).query)
+                target = (qs.get('target', [''])[0] or '').strip()
+            except Exception:
+                target = ''
+            if target and re.match(r"^[A-Za-z0-9_.:-]+$", target) and ':' in target:
+                SERVICES.ensure(target)
+                EVENTS.log("SERVICE_TARGET_ADDED", target=target)
+                self.send_response(302)
+                self.send_header('Location', '/')
+                self.end_headers()
+                return
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b'Invalid service target')
+            return
+        if self.path.startswith("/delsvc?"):
+            try:
+                from urllib.parse import urlsplit, parse_qs
+                qs = parse_qs(urlsplit(self.path).query)
+                target = (qs.get('target', [''])[0] or '').strip()
+            except Exception:
+                target = ''
+            if target:
+                removed = SERVICES.remove(target)
+                if removed:
+                    EVENTS.log("SERVICE_TARGET_REMOVED", target=target)
+                self.send_response(302)
+                self.send_header('Location', '/')
+                self.end_headers()
+                return
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b'missing target')
             return
         if self.path.startswith("/del?"):
             try:
@@ -630,6 +824,47 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(out)
             return
+        if self.path.startswith("/api/services"):
+            length = int(self.headers.get('Content-Length') or 0)
+            raw = self.rfile.read(length) if length > 0 else b''
+            target = None
+            action = ''
+            try:
+                if raw:
+                    obj = json.loads(raw.decode('utf-8'))
+                    target = (obj.get('target') or '').strip()
+                    action = (obj.get('action') or '').strip().lower()
+            except Exception:
+                pass
+            if not target:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"ok":false,"error":"missing target"}')
+                return
+            if len(target) > 253 or not re.match(r"^[A-Za-z0-9_.:-]+$", target) or ':' not in target:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"ok":false,"error":"invalid target"}')
+                return
+            if action in ("delete", "remove"):
+                removed = SERVICES.remove(target)
+                if removed:
+                    EVENTS.log("SERVICE_TARGET_REMOVED", target=target)
+                out = json.dumps({"ok": True, "removed": bool(removed)}).encode('utf-8')
+            else:
+                SERVICES.ensure(target)
+                EVENTS.log("SERVICE_TARGET_ADDED", target=target)
+                out = json.dumps({"ok": True, "added": True}).encode('utf-8')
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+            self.end_headers()
+            self.wfile.write(out)
+            return
         # Unknown
         self.send_response(404)
         self.end_headers()
@@ -642,6 +877,9 @@ def run(port: int):
 
     t2 = threading.Thread(target=heartbeat_worker, name="heartbeat-worker", daemon=True)
     t2.start()
+
+    t3 = threading.Thread(target=service_worker, name="service-worker", daemon=True)
+    t3.start()
 
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print(f"[live_status] Listening on 0.0.0.0:{port}")
