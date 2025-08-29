@@ -25,7 +25,7 @@
           const p=pings[t]||{}; const ok=!!p.ok; const color= ok?'#22aa22':'#cc2222';
           const lat=(p.latency_ms!=null)?(p.latency_ms.toFixed(2)+' ms'):'—';
           const misses=p.misses||0; const when=p.ts_fmt||'—';
-          html += '<tr><td>'+esc(t)+'</td><td style="color:'+color+';font-weight:bold">'+(ok?'OK':'FAIL')+'</td><td>'+lat+'</td><td>'+misses+'</td><td>'+esc(when)+'</td></tr>';
+          html += '<tr><td>'+esc(t)+'</td><td style="color:'+color+';font-weight:bold">'+(ok?'OK':'FAIL')+'</td><td>'+lat+'</td><td>'+misses+'</td><td>'+esc(when)+'</td><td><button class="rm" data-t="'+esc(t)+'">Delete</button></td></tr>';
         }
         tbody.innerHTML=html;
       }
@@ -43,6 +43,19 @@
       const pre=document.getElementById('eventsPre'); if(pre) pre.textContent=(d.events && d.events.tail) || '';
     }catch(e){/* ignore */}
   }
-  window.addEventListener('DOMContentLoaded', function(){ update(); setInterval(update, 1000); });
+  function delTarget(t){
+    fetch('/api/pings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'delete', target:t})})
+      .then(()=>update());
+  }
+  window.addEventListener('DOMContentLoaded', function(){
+    update();
+    setInterval(update, 1000);
+    const body=document.getElementById('pingBody');
+    if(body){
+      body.addEventListener('click', function(ev){
+        const el=ev.target;
+        if(el && el.matches('button.rm')){ ev.preventDefault(); delTarget(el.dataset.t); }
+      });
+    }
+  });
 })();
-

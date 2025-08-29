@@ -122,6 +122,13 @@ class PingState:
         with self.lock:
             return list(self.latest.keys())
 
+    def remove_target(self, target: str) -> bool:
+        with self.lock:
+            if target in self.latest:
+                self.latest.pop(target, None)
+                return True
+            return False
+
 
 PING_STATE = PingState(PING_TARGETS)
 
@@ -397,7 +404,8 @@ def render_index() -> bytes:
         color = "#22aa22" if status == "OK" else "#cc2222"
         latency_s = f"{latency:.2f} ms" if latency is not None else "—"
         misses = data.get("misses", 0)
-        return f"<tr><td>{html_escape(target)}</td><td style='color:{color};font-weight:bold'>{status}</td><td>{latency_s}</td><td>{misses}</td><td>{html_escape(when)}</td></tr>"
+        # include actions cell for initial render
+        return f"<tr><td>{html_escape(target)}</td><td style='color:{color};font-weight:bold'>{status}</td><td>{latency_s}</td><td>{misses}</td><td>{html_escape(when)}</td><td><a href='/del?target={html_escape(target)}'>Delete</a></td></tr>"
 
     hb_when = format_dt(hb["last_write_ts"]) if hb["last_write_ts"] else "—"
     hb_err = hb["last_error"]
@@ -445,7 +453,7 @@ def render_index() -> bytes:
     <div class="muted" style="margin:0.25rem 0">Add target: <form method="GET" action="/add" style="display:inline"><input name="target" placeholder="host or IP" style="padding:0.2rem 0.4rem"/><button type="submit" style="padding:0.2rem 0.5rem">Add</button></form></div>
     <table>
       <thead>
-        <tr><th>Target</th><th>Status</th><th>Latency</th><th>Missed</th><th>Last Check</th></tr>
+        <tr><th>Target</th><th>Status</th><th>Latency</th><th>Missed</th><th>Last Check</th><th>Actions</th></tr>
       </thead>
       <tbody id="pingBody">
         {''.join(ping_row(t, pings.get(t, {})) for t in sorted(pings.keys()))}
@@ -498,6 +506,25 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Expires", "0")
             self.end_headers()
             self.wfile.write(data)
+            return
+        if self.path.startswith("/del?"):
+            try:
+                from urllib.parse import urlsplit, parse_qs
+                qs = parse_qs(urlsplit(self.path).query)
+                target = (qs.get('target', [''])[0] or '').strip()
+            except Exception:
+                target = ''
+            if target:
+                removed = PING_STATE.remove_target(target)
+                if removed:
+                    EVENTS.log("PING_TARGET_REMOVED", target=target)
+                self.send_response(302)
+                self.send_header('Location', '/')
+                self.end_headers()
+                return
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b'missing target')
             return
         if self.path.startswith("/add?"):
             # Simple add-target endpoint: /add?target=host-or-ip
@@ -555,6 +582,57 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         # Slim logging with timestamp
         sys.stderr.write("[%s] %s\n" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), fmt % args))
+
+    def do_POST(self):
+        if self.path.startswith("/api/pings"):
+            length = int(self.headers.get('Content-Length') or 0)
+            raw = self.rfile.read(length) if length > 0 else b''
+            target = None
+            action = ''
+            delete_flag = False
+            try:
+                if raw:
+                    obj = json.loads(raw.decode('utf-8'))
+                    target = (obj.get('target') or '').strip()
+                    action = (obj.get('action') or '').strip().lower()
+                    delete_flag = bool(obj.get('delete'))
+            except Exception:
+                pass
+            if not target:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"ok":false,"error":"missing target"}')
+                return
+            if len(target) > 253 or not re.match(r"^[A-Za-z0-9_.:-]+$", target):
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"ok":false,"error":"invalid target"}')
+                return
+            if action in ("delete", "remove") or delete_flag:
+                removed = PING_STATE.remove_target(target)
+                if removed:
+                    EVENTS.log("PING_TARGET_REMOVED", target=target)
+                out = json.dumps({"ok": True, "removed": bool(removed)}).encode('utf-8')
+            else:
+                with PING_STATE.lock:
+                    added = target not in PING_STATE.latest
+                    PING_STATE.latest.setdefault(target, {"ok": False, "latency_ms": None, "ts": None, "err": None, "misses": 0, "checks": 0})
+                if added:
+                    EVENTS.log("PING_TARGET_ADDED", target=target)
+                out = json.dumps({"ok": True, "added": bool(added)}).encode('utf-8')
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+            self.end_headers()
+            self.wfile.write(out)
+            return
+        # Unknown
+        self.send_response(404)
+        self.end_headers()
 
 
 def run(port: int):
